@@ -1,0 +1,1297 @@
+openapi: 3.0.3
+info:
+  title: Sistema de Gestión de Subvenciones API
+  description: |
+    API REST para el Sistema de Gestión de Subvenciones de Alquiler.
+    
+    ## Autenticación
+    La API utiliza JWT (JSON Web Tokens) para autenticación. Los tokens se envían en el header `Authorization` con el prefijo `Bearer`.
+    
+    ## Roles
+    - **BENEFICIARIO**: Solicitante de la subvención
+    - **ARRENDADOR**: Propietario del inmueble
+    - **DIGER**: Personal administrativo que gestiona solicitudes
+    - **DIRECTORA**: Directora que aprueba solicitudes
+    - **ORDENADOR_GASTO**: Responsable de firma final
+    - **CRI**: Centro de Recursos Informáticos (auditoría)
+    
+    ## Estados del Proceso
+    - BORRADOR → ENVIADA → EN_VALIDACION → PENDIENTE_DIRECTORA → APROBADA_DIRECTORA → REVISION_ORDENADOR → APROBADA → CERRADA
+    - También: RECHAZADA, CORRECCION_SOLICITADA
+  version: 1.0.0
+  contact:
+    name: Soporte Técnico
+    email: soporte@subvenciones.gob.es
+  license:
+    name: Propietario
+servers:
+  - url: http://localhost:4000/api
+    description: Servidor de desarrollo
+  - url: https://api.subvenciones.gob.es/api
+    description: Servidor de producción
+
+tags:
+  - name: Autenticación
+    description: Endpoints de autenticación y gestión de sesiones
+  - name: Usuarios
+    description: Gestión de usuarios del sistema
+  - name: Procesos
+    description: Gestión de procesos de subvención
+  - name: Documentos
+    description: Gestión documental
+  - name: Catálogo
+    description: Datos maestros y catálogos
+  - name: Auditoría
+    description: Consulta de eventos de auditoría
+
+paths:
+  # ==================== AUTENTICACIÓN ====================
+  /auth/login:
+    post:
+      tags: [Autenticación]
+      summary: Iniciar sesión
+      description: Autentica un usuario y devuelve tokens JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cedula, password]
+              properties:
+                cedula:
+                  type: string
+                  example: "12345678-9"
+                password:
+                  type: string
+                  format: password
+                  example: "MiContraseña123!"
+      responses:
+        '200':
+          description: Login exitoso
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '202':
+          description: Requiere MFA
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requiresMfa:
+                    type: boolean
+                    example: true
+                  tempToken:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '423':
+          description: Cuenta bloqueada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/login/mfa:
+    post:
+      tags: [Autenticación]
+      summary: Verificar código MFA
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tempToken, code]
+              properties:
+                tempToken:
+                  type: string
+                code:
+                  type: string
+                  example: "123456"
+      responses:
+        '200':
+          description: MFA verificado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/refresh:
+    post:
+      tags: [Autenticación]
+      summary: Renovar token de acceso
+      description: Usa el refresh token (cookie httpOnly) para obtener nuevo access token
+      responses:
+        '200':
+          description: Token renovado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/logout:
+    post:
+      tags: [Autenticación]
+      summary: Cerrar sesión
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Sesión cerrada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Sesión cerrada correctamente"
+
+  /auth/me:
+    get:
+      tags: [Autenticación]
+      summary: Obtener usuario actual
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Información del usuario
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/change-password:
+    post:
+      tags: [Autenticación]
+      summary: Cambiar contraseña
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword:
+                  type: string
+                newPassword:
+                  type: string
+                  minLength: 10
+      responses:
+        '200':
+          description: Contraseña cambiada
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /auth/mfa/setup:
+    post:
+      tags: [Autenticación]
+      summary: Configurar MFA
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Datos para configurar MFA
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret:
+                    type: string
+                  qrCode:
+                    type: string
+                    description: Data URL de imagen QR
+
+  /auth/mfa/verify:
+    post:
+      tags: [Autenticación]
+      summary: Verificar y activar MFA
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+      responses:
+        '200':
+          description: MFA activado
+
+  # ==================== USUARIOS ====================
+  /users:
+    get:
+      tags: [Usuarios]
+      summary: Listar usuarios
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: rol
+          in: query
+          schema:
+            $ref: '#/components/schemas/Rol'
+        - name: estado
+          in: query
+          schema:
+            $ref: '#/components/schemas/EstadoUsuario'
+      responses:
+        '200':
+          description: Lista de usuarios
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/User'
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Usuarios]
+      summary: Crear usuario
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUser'
+      responses:
+        '201':
+          description: Usuario creado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /users/{id}:
+    get:
+      tags: [Usuarios]
+      summary: Obtener usuario por ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/userId'
+      responses:
+        '200':
+          description: Usuario encontrado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Usuarios]
+      summary: Actualizar usuario
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/userId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUser'
+      responses:
+        '200':
+          description: Usuario actualizado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /users/{id}/deactivate:
+    post:
+      tags: [Usuarios]
+      summary: Desactivar usuario
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/userId'
+      responses:
+        '200':
+          description: Usuario desactivado
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /users/{id}/unlock:
+    post:
+      tags: [Usuarios]
+      summary: Desbloquear usuario
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/userId'
+      responses:
+        '200':
+          description: Usuario desbloqueado
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ==================== PROCESOS ====================
+  /procesos:
+    get:
+      tags: [Procesos]
+      summary: Listar procesos
+      description: |
+        Devuelve los procesos según el rol del usuario:
+        - BENEFICIARIO: Solo sus propios procesos
+        - ARRENDADOR: Procesos donde es arrendador
+        - DIGER/DIRECTORA/ORDENADOR_GASTO: Todos los procesos
+        - CRI: Todos los procesos (solo lectura)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+        - name: estado
+          in: query
+          schema:
+            $ref: '#/components/schemas/EstadoProceso'
+        - name: search
+          in: query
+          schema:
+            type: string
+            description: Buscar por código o nombre de beneficiario
+      responses:
+        '200':
+          description: Lista de procesos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  procesos:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProcesoResumen'
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
+
+    post:
+      tags: [Procesos]
+      summary: Crear proceso
+      description: Solo rol DIGER puede crear procesos
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [beneficiarioId]
+              properties:
+                beneficiarioId:
+                  type: string
+                  format: uuid
+                arrendadorId:
+                  type: string
+                  format: uuid
+      responses:
+        '201':
+          description: Proceso creado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Proceso'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /procesos/{id}:
+    get:
+      tags: [Procesos]
+      summary: Obtener proceso por ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      responses:
+        '200':
+          description: Proceso encontrado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Proceso'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /procesos/{id}/formulario:
+    put:
+      tags: [Procesos]
+      summary: Actualizar formulario del proceso
+      description: Solo en estado BORRADOR o CORRECCION_SOLICITADA
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Datos del formulario (esquema libre)
+      responses:
+        '200':
+          description: Formulario actualizado
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /procesos/{id}/enviar:
+    post:
+      tags: [Procesos]
+      summary: Enviar proceso para revisión
+      description: Cambia estado de BORRADOR a ENVIADA
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      responses:
+        '200':
+          description: Proceso enviado
+        '400':
+          description: Proceso no puede ser enviado
+
+  /procesos/{id}/iniciar-validacion:
+    post:
+      tags: [Procesos]
+      summary: Iniciar validación del proceso
+      description: Solo rol DIGER. Cambia estado de ENVIADA a EN_VALIDACION
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      responses:
+        '200':
+          description: Validación iniciada
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /procesos/{id}/decision:
+    post:
+      tags: [Procesos]
+      summary: Registrar decisión sobre el proceso
+      description: |
+        Permite aprobar o rechazar según el rol:
+        - DIGER: EN_VALIDACION → PENDIENTE_DIRECTORA o RECHAZADA
+        - DIRECTORA: PENDIENTE_DIRECTORA → APROBADA_DIRECTORA o RECHAZADA
+        - ORDENADOR_GASTO: REVISION_ORDENADOR → APROBADA o RECHAZADA
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [APROBADO, RECHAZADO]
+                observaciones:
+                  type: string
+      responses:
+        '200':
+          description: Decisión registrada
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /procesos/{id}/solicitar-correccion:
+    post:
+      tags: [Procesos]
+      summary: Solicitar corrección al beneficiario
+      description: Solo rol DIGER en estado EN_VALIDACION
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [observaciones]
+              properties:
+                observaciones:
+                  type: string
+      responses:
+        '200':
+          description: Corrección solicitada
+
+  /procesos/{id}/firmar:
+    post:
+      tags: [Procesos]
+      summary: Firmar documento del proceso
+      description: Solo rol ORDENADOR_GASTO en estado APROBADA_DIRECTORA
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pin:
+                  type: string
+                  description: PIN de firma electrónica
+      responses:
+        '200':
+          description: Documento firmado
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /procesos/{id}/cerrar:
+    post:
+      tags: [Procesos]
+      summary: Cerrar proceso
+      description: Solo rol DIGER en estado APROBADA
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      responses:
+        '200':
+          description: Proceso cerrado
+
+  /procesos/{id}/timeline:
+    get:
+      tags: [Procesos]
+      summary: Obtener línea de tiempo del proceso
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      responses:
+        '200':
+          description: Línea de tiempo
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TimelineEvent'
+
+  # ==================== DOCUMENTOS ====================
+  /procesos/{id}/documentos:
+    get:
+      tags: [Documentos]
+      summary: Listar documentos del proceso
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      responses:
+        '200':
+          description: Lista de documentos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Documento'
+
+    post:
+      tags: [Documentos]
+      summary: Subir documento
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, tipoDocumentoId]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                tipoDocumentoId:
+                  type: string
+                  format: uuid
+      responses:
+        '201':
+          description: Documento subido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Documento'
+        '400':
+          description: Archivo inválido
+
+  /documentos/{id}:
+    get:
+      tags: [Documentos]
+      summary: Obtener metadatos del documento
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Metadatos del documento
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Documento'
+
+    delete:
+      tags: [Documentos]
+      summary: Eliminar documento
+      description: Solo en estado BORRADOR o CORRECCION_SOLICITADA
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Documento eliminado
+        '400':
+          description: No se puede eliminar en el estado actual
+
+  /documentos/{id}/download:
+    get:
+      tags: [Documentos]
+      summary: Descargar documento
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Archivo del documento
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+  /documentos/{id}/validar:
+    post:
+      tags: [Documentos]
+      summary: Validar o rechazar documento
+      description: Solo rol DIGER
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [estado]
+              properties:
+                estado:
+                  type: string
+                  enum: [APROBADO, RECHAZADO]
+                observaciones:
+                  type: string
+      responses:
+        '200':
+          description: Documento validado
+
+  # ==================== CATÁLOGO ====================
+  /catalogo/tipos-documento:
+    get:
+      tags: [Catálogo]
+      summary: Obtener tipos de documento
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Lista de tipos de documento
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TipoDocumento'
+
+  /catalogo/convocatorias:
+    get:
+      tags: [Catálogo]
+      summary: Obtener convocatorias activas
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Lista de convocatorias
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Convocatoria'
+
+  /catalogo/roles:
+    get:
+      tags: [Catálogo]
+      summary: Obtener roles disponibles
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Lista de roles
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    value:
+                      $ref: '#/components/schemas/Rol'
+                    label:
+                      type: string
+
+  /catalogo/estados-proceso:
+    get:
+      tags: [Catálogo]
+      summary: Obtener estados de proceso
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Lista de estados
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    value:
+                      $ref: '#/components/schemas/EstadoProceso'
+                    label:
+                      type: string
+
+  # ==================== AUDITORÍA ====================
+  /auditoria/eventos:
+    get:
+      tags: [Auditoría]
+      summary: Obtener eventos de auditoría
+      description: Solo roles DIGER y CRI
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+        - name: accion
+          in: query
+          schema:
+            type: string
+        - name: usuarioId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: desde
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: hasta
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Lista de eventos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  eventos:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EventoAuditoria'
+                  total:
+                    type: integer
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /auditoria/procesos/{id}:
+    get:
+      tags: [Auditoría]
+      summary: Obtener eventos de un proceso
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/procesoId'
+      responses:
+        '200':
+          description: Eventos del proceso
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EventoAuditoria'
+
+  /auditoria/estadisticas:
+    get:
+      tags: [Auditoría]
+      summary: Obtener estadísticas de auditoría
+      description: Solo rol CRI
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: desde
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: hasta
+          in: query
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: Estadísticas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  totalEventos:
+                    type: integer
+                  eventosPorAccion:
+                    type: object
+                  eventosPorDia:
+                    type: array
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 10
+    userId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    procesoId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Solicitud inválida
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: No autenticado
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Sin permisos
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Recurso no encontrado
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+
+    Rol:
+      type: string
+      enum: [BENEFICIARIO, ARRENDADOR, DIGER, DIRECTORA, ORDENADOR_GASTO, CRI]
+
+    EstadoUsuario:
+      type: string
+      enum: [ACTIVO, INACTIVO, BLOQUEADO]
+
+    EstadoProceso:
+      type: string
+      enum:
+        - BORRADOR
+        - ENVIADA
+        - EN_VALIDACION
+        - CORRECCION_SOLICITADA
+        - PENDIENTE_DIRECTORA
+        - APROBADA_DIRECTORA
+        - REVISION_ORDENADOR
+        - APROBADA
+        - RECHAZADA
+        - CERRADA
+
+    LoginResponse:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        user:
+          $ref: '#/components/schemas/User'
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        cedula:
+          type: string
+        email:
+          type: string
+          format: email
+        nombreCompleto:
+          type: string
+        rol:
+          $ref: '#/components/schemas/Rol'
+        estado:
+          $ref: '#/components/schemas/EstadoUsuario'
+        mfaHabilitado:
+          type: boolean
+        creadoEn:
+          type: string
+          format: date-time
+
+    CreateUser:
+      type: object
+      required: [cedula, email, nombreCompleto, password, rol]
+      properties:
+        cedula:
+          type: string
+        email:
+          type: string
+          format: email
+        nombreCompleto:
+          type: string
+        password:
+          type: string
+          minLength: 10
+        rol:
+          $ref: '#/components/schemas/Rol'
+
+    UpdateUser:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        nombreCompleto:
+          type: string
+        rol:
+          $ref: '#/components/schemas/Rol'
+
+    ProcesoResumen:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        codigo:
+          type: string
+          example: "SUB-2024-000001"
+        estado:
+          $ref: '#/components/schemas/EstadoProceso'
+        beneficiario:
+          type: object
+          properties:
+            id:
+              type: string
+            nombreCompleto:
+              type: string
+        creadoEn:
+          type: string
+          format: date-time
+        actualizadoEn:
+          type: string
+          format: date-time
+
+    Proceso:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        codigo:
+          type: string
+        estado:
+          $ref: '#/components/schemas/EstadoProceso'
+        beneficiario:
+          $ref: '#/components/schemas/User'
+        arrendador:
+          $ref: '#/components/schemas/User'
+        formulario:
+          type: object
+        documentos:
+          type: array
+          items:
+            $ref: '#/components/schemas/Documento'
+        decisiones:
+          type: array
+          items:
+            $ref: '#/components/schemas/Decision'
+        creadoEn:
+          type: string
+          format: date-time
+        actualizadoEn:
+          type: string
+          format: date-time
+
+    Documento:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        nombreOriginal:
+          type: string
+        mimeType:
+          type: string
+        tamanoBytes:
+          type: integer
+        hash:
+          type: string
+        estado:
+          type: string
+          enum: [PENDIENTE, APROBADO, RECHAZADO]
+        catalogo:
+          $ref: '#/components/schemas/TipoDocumento'
+        subidoPor:
+          $ref: '#/components/schemas/User'
+        creadoEn:
+          type: string
+          format: date-time
+
+    TipoDocumento:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        codigo:
+          type: string
+        nombre:
+          type: string
+        descripcion:
+          type: string
+        obligatorio:
+          type: boolean
+        extensionesPermitidas:
+          type: array
+          items:
+            type: string
+
+    Decision:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tipo:
+          type: string
+          enum: [APROBADO, RECHAZADO, CORRECCION_SOLICITADA]
+        observaciones:
+          type: string
+        responsable:
+          $ref: '#/components/schemas/User'
+        fecha:
+          type: string
+          format: date-time
+
+    Convocatoria:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        nombre:
+          type: string
+        anio:
+          type: integer
+        fechaInicio:
+          type: string
+          format: date
+        fechaFin:
+          type: string
+          format: date
+        activa:
+          type: boolean
+
+    TimelineEvent:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tipo:
+          type: string
+        descripcion:
+          type: string
+        responsable:
+          type: object
+          properties:
+            nombre:
+              type: string
+            rol:
+              $ref: '#/components/schemas/Rol'
+        observaciones:
+          type: string
+        fecha:
+          type: string
+          format: date-time
+
+    EventoAuditoria:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        accion:
+          type: string
+        entidad:
+          type: string
+        entidadId:
+          type: string
+        detalles:
+          type: object
+        ip:
+          type: string
+        userAgent:
+          type: string
+        usuario:
+          type: object
+          properties:
+            id:
+              type: string
+            nombreCompleto:
+              type: string
+        fecha:
+          type: string
+          format: date-time
+
+security:
+  - bearerAuth: []
